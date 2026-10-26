@@ -258,32 +258,41 @@ async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 for attempt in range(3):
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt
+      
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+                model=MODEL_NAME,
+                contents=prompt
+            ),
+            timeout=9
         )
-        break
-    except ServerError:
-        if attempt == 2:
-            raise
-        time.sleep(2 ** (attempt + 1))
 
-        answer = response.text or "Kechirasiz, hozir javob tayyorlay olmadim."
+        answer = (
+            response.text
+            if response and response.text
+            else "Kechirasiz, javob tayyorlanmadi."
+        )
 
         history.append(f"Yordamchi: {answer}")
         history[:] = history[-10:]
 
-        # Telegram xabar uzunligi chegarasidan oshmasligi uchun
         for i in range(0, len(answer), 4000):
             await message.reply_text(answer[i:i + 4000])
+
+    except asyncio.TimeoutError:
+        await message.reply_text(
+            "⏳ AI hozir sekin ishlayapti. "
+            "Iltimos, savolingizni qayta yuboring."
+        )
 
     except Exception:
         logging.exception("Gemini API xatoligi")
         await message.reply_text(
-            "⚠️ AI javobida xatolik yuz berdi. "
+            "⚠️ Hozir javob olishda xatolik yuz berdi. "
             "Birozdan so'ng qayta urinib ko'ring."
         )
-
 
 # ---------- RENDER WEB SERVICE UCHUN ----------
 
