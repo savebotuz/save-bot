@@ -1,365 +1,414 @@
-import time
-import os
-import asyncio
-import sqlite3
-import logging
-from datetime import datetime
 
+import asyncio
+import logging
+import os
+import sqlite3
+from datetime import datetime, timezone
+
+from google import genai
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
-from google import genai
 
-# ---------- SOZLAMALAR ----------
+# =========================
+# SOZLAMALAR
+# =========================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 MODEL_NAME = "gemini-3.8-flash"
-DB_NAME = "savebot.db"
+DATABASE = "savebot.db"
+AI_TIMEOUT = 8.5
+MAX_HISTORY = 10
+MAX_OUTPUT_CHARS = 3900
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN sozlanmagan!")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN sozlanmagan.")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY sozlanmagan!")
+    raise RuntimeError("GEMINI_API_KEY sozlanmagan.")
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 chat_history = {}
 
 
-# ---------- MA'LUMOTLAR BAZASI ----------
+# =========================
+# MA'LUMOTLAR BAZASI
+# =========================
 
 def init_db():
-    with sqlite3.connect(DB_NAME) as db:
+    with sqlite3.connect(DATABASE) as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS saved_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                item_type TEXT NOT NULL,
+                kind TEXT NOT NULL,
                 content TEXT,
                 file_id TEXT,
                 created_at TEXT NOT NULL
             )
         """)
+        db.commit()
 
 
-def save_item(user_id, item_type, content=None, file_id=None):
-    with sqlite3.connect(DB_NAME) as db:
+def save_item(user_id, kind, content=None, file_id=None):
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    with sqlite3.connect(DATABASE) as db:
         db.execute(
             """
             INSERT INTO saved_items
-            (user_id, item_type, content, file_id, created_at)
+                (user_id, kind, content, file_id, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (
-                user_id,
-                item_type,
-                content,
-                file_id,
-                datetime.now().strftime("%Y-%m-%d %H:%M"),
-            ),
+            (user_id, kind, content, file_id, created_at),
         )
+        db.commit()
 
 
-# ---------- /start ----------
+def get_saved_items(user_id, limit=10):
+    with sqlite3.connect(DATABASE) as db:
+        return db.execute(
+            """
+            SELECT id, kind, content, file_id, created_at
+            FROM saved_items
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+
+
+# =========================
+# BUYRUQLAR
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 Assalomu alaykum! Save Bot'ga xush kelibsiz!\n\n"
-        "Men sizga quyidagilarda yordam beraman:\n"
-        "🤖 Sun'iy intellekt bilan suhbat\n"
-        "🌐 Tarjima va til o'rganish\n"
-        "📚 Darslar va konspektlar\n"
-        "💡 G'oyalar va matn yozish\n"
-        "📁 Matn, rasm, video va hujjatlarni saqlash\n\n"
+    await update.effective_message.reply_text(
+        "👋 Assalomu alaykum! Men Save Bot.\n\n"
+        "🤖 Savol yozing — AI javob beradi.\n"
+        "🌐 Tarjima va darslarda yordam beraman.\n"
+        "💾 Matn yoki fayllarni saqlayman.\n\n"
         "Buyruqlar:\n"
         "/save matn — matnni saqlash\n"
-        "/saved — saqlanganlarni ko'rish\n"
-        "/clear — suhbat tarixini tozalash\n"
+        "/saved — saqlanganlarni ko‘rish\n"
+        "/clear — saqlanganlarni o‘chirish\n"
         "/help — yordam"
     )
-    await update.effective_message.reply_text(text)
 
 
-# ---------- /help ----------
+async def help_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    await update.effective_message.reply_text(
+        "📚 Save Bot yordami\n\n"
+        "• Istalgan savolingizni yozing.\n"
+        "• /save matn — matnni saqlaydi.\n"
+        "• /saved — oxirgi 10 ta saqlangan narsani ko‘rsatadi.\n"
+        "• Rasm, video va hujjat yuborsangiz, ular saqlanadi.\n"
+        "• /clear — saqlangan narsalarni o‘chiradi."
+    )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
 
-
-# ---------- MATN SAQLASH ----------
-
-async def save_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     message = update.effective_message
+    user = update.effective_user
+
     text = " ".join(context.args).strip()
+
+    if not text and message.reply_to_message:
+        replied = message.reply_to_message
+        text = replied.text or replied.caption or ""
 
     if not text:
         await message.reply_text(
-            "Saqlamoqchi bo'lgan matningizni buyruqdan keyin yozing.\n\n"
-            "Masalan:\n/save Ertaga tarixdan seminar bor"
+            "Saqlash uchun matn yozing:\n/save Kerakli matn"
         )
         return
 
-    save_item(
-        update.effective_user.id,
-        "text",
-        content=text,
-    )
-    await message.reply_text("✅ Matningiz saqlandi!")
+    save_item(user.id, "text", content=text)
+    await message.reply_text("✅ Matn saqlandi!")
 
 
-# ---------- RASM, VIDEO VA HUJJATLAR ----------
-
-async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_saved(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     message = update.effective_message
+    user = update.effective_user
+    items = get_saved_items(user.id)
+
+    if not items:
+        await message.reply_text("📭 Hozircha saqlangan narsalar yo‘q.")
+        return
+
+    await message.reply_text("📂 Oxirgi saqlangan narsalaringiz:")
+
+    for item_id, kind, content, file_id, created_at in reversed(items):
+        try:
+            if kind == "text":
+                text = (content or "")[:3500]
+                await message.reply_text(f"📝 {text}")
+            elif kind == "photo":
+                await message.reply_photo(
+                    file_id, caption=(content or "🖼 Saqlangan rasm")[:1000]
+                )
+            elif kind == "video":
+                await message.reply_video(
+                    file_id, caption=(content or "🎬 Saqlangan video")[:1000]
+                )
+            elif kind == "document":
+                await message.reply_document(
+                    file_id, caption=(content or "📄 Saqlangan hujjat")[:1000]
+                )
+            elif kind == "audio":
+                await message.reply_audio(file_id)
+            elif kind == "voice":
+                await message.reply_voice(file_id)
+        except TelegramError:
+            logging.exception("Saqlangan elementni yuborib bo‘lmadi: %s", item_id)
+            await message.reply_text(
+                f"⚠️ {item_id}-elementni yuborib bo‘lmadi."
+            )
+
+
+async def clear_saved(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     user_id = update.effective_user.id
 
+    with sqlite3.connect(DATABASE) as db:
+        db.execute(
+            "DELETE FROM saved_items WHERE user_id = ?", (user_id,)
+        )
+        db.commit()
+
+    chat_history.pop(user_id, None)
+    await update.effective_message.reply_text(
+        "🗑 Saqlangan narsalaringiz o‘chirildi."
+    )
+
+
+# =========================
+# RASM VA FAYLLARNI SAQLASH
+# =========================
+
+async def save_media(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.effective_message
+    user = update.effective_user
+
     if message.photo:
-        item_type = "photo"
+        kind = "photo"
         file_id = message.photo[-1].file_id
     elif message.video:
-        item_type = "video"
+        kind = "video"
         file_id = message.video.file_id
     elif message.document:
-        item_type = "document"
+        kind = "document"
         file_id = message.document.file_id
+    elif message.audio:
+        kind = "audio"
+        file_id = message.audio.file_id
+    elif message.voice:
+        kind = "voice"
+        file_id = message.voice.file_id
     else:
         return
 
     caption = message.caption or ""
-
-    save_item(
-        user_id,
-        item_type,
-        content=caption,
-        file_id=file_id,
-    )
-
-    await message.reply_text(
-        "✅ Faylingiz saqlandi!\n"
-        "Uni keyin /saved buyrug'i orqali ko'rishingiz mumkin."
-    )
+    save_item(user.id, kind, content=caption, file_id=file_id)
+    await message.reply_text("💾 Fayl saqlandi! /saved orqali ko‘rishingiz mumkin.")
 
 
-# ---------- /saved ----------
+# =========================
+# GEMINI AI
+# =========================
 
-async def saved_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    with sqlite3.connect(DB_NAME) as db:
-        rows = db.execute(
-            """
-            SELECT item_type, content, file_id, created_at
-            FROM saved_items
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 10
-            """,
-            (user_id,),
-        ).fetchall()
-
-    if not rows:
-        await update.effective_message.reply_text(
-            "📂 Hozircha saqlangan narsalar yo'q."
-        )
-        return
-
-    await update.effective_message.reply_text(
-        f"📁 Oxirgi {len(rows)} ta saqlangan yozuvingiz:"
-    )
-
-    for item_type, content, file_id, created_at in reversed(rows):
-        try:
-            if item_type == "text":
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"📝 {content}\n🕒 {created_at}",
-                )
-
-            elif item_type == "photo":
-                await context.bot.send_photo(
-                    chat_id=user_id,
-                    photo=file_id,
-                    caption=content or None,
-                )
-
-            elif item_type == "video":
-                await context.bot.send_video(
-                    chat_id=user_id,
-                    video=file_id,
-                    caption=content or None,
-                )
-
-            elif item_type == "document":
-                await context.bot.send_document(
-                    chat_id=user_id,
-                    document=file_id,
-                    caption=content or None,
-                )
-
-        except Exception:
-            logging.exception("Saqlangan faylni yuborishda xatolik")
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⚠️ Bir faylni qayta yuborib bo'lmadi. Sana: {created_at}",
-            )
-
-
-# ---------- /clear ----------
-
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_history.pop(user_id, None)
-
-    await update.effective_message.reply_text(
-        "🧹 AI suhbat tarixingiz tozalandi.\n"
-        "Saqlangan matn va fayllaringiz o'chirilmadi."
+def generate_ai_answer(prompt):
+    return client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
     )
 
 
-# ---------- SUN'IY INTELLEKT ----------
-
-async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ai_chat(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     message = update.effective_message
-    user_id = update.effective_user.id
-    user_text = message.text.strip()
+    user = update.effective_user
+    user_text = (message.text or "").strip()
 
     if not user_text:
         return
 
-    history = chat_history.setdefault(user_id, [])
+    history = chat_history.setdefault(user.id, [])
     history.append(f"Foydalanuvchi: {user_text}")
-    history[:] = history[-10:]
+    history[:] = history[-MAX_HISTORY:]
 
     prompt = (
         "Sen Save Bot nomli foydali AI yordamchisisan. "
-        "Foydalanuvchiga o'zbek tilida, sodda va aniq javob ber. "
-        "Agar foydalanuvchi boshqa tilda yozsa, o'sha tilda javob ber. "
-        "Tarjima, ta'lim, tarix, yozish va kundalik savollarda yordam ber.\n\n"
+        "Odatda o‘zbek tilida sodda, aniq va foydali javob ber. "
+        "Foydalanuvchi boshqa tilda yozsa, o‘sha tilda javob ber. "
+        "Tarjima, ta’lim, tarix, yozish va kundalik savollarda yordam ber. "
+        "Keraksiz uzun kirish so‘zlarini ishlatma.\n\n"
         + "\n".join(history)
         + "\nYordamchi:"
     )
 
-    await message.reply_text("🤔 Javob tayyorlayapman...")
+    status = await message.reply_text("🤔 Savolingizni ko‘rib chiqyapman...")
 
-    try:
-       from google.genai.errors import ServerError
-
-for attempt in range(3):
-    try:
-      
     try:
         response = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.models.generate_content,
-                model=MODEL_NAME,
-                contents=prompt
-            ),
-            timeout=9
+            asyncio.to_thread(generate_ai_answer, prompt),
+            timeout=AI_TIMEOUT,
         )
 
         answer = (
-            response.text
-            if response and response.text
-            else "Kechirasiz, javob tayyorlanmadi."
+            (response.text or "").strip()
+            if response else ""
         )
 
-        history.append(f"Yordamchi: {answer}")
-        history[:] = history[-10:]
+        if not answer:
+            answer = "Kechirasiz, hozir javob tayyorlay olmadim."
 
-        for i in range(0, len(answer), 4000):
-            await message.reply_text(answer[i:i + 4000])
+        history.append(f"Yordamchi: {answer}")
+        history[:] = history[-MAX_HISTORY:]
+
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+
+        for index in range(0, len(answer), MAX_OUTPUT_CHARS):
+            await message.reply_text(
+                answer[index:index + MAX_OUTPUT_CHARS]
+            )
 
     except asyncio.TimeoutError:
-        await message.reply_text(
-            "⏳ AI hozir sekin ishlayapti. "
-            "Iltimos, savolingizni qayta yuboring."
+        await status.edit_text(
+            "⏳ AI javobi 9 soniyada kelmadi. "
+            "Iltimos, savolingizni yana bir marta yuboring."
         )
 
     except Exception:
         logging.exception("Gemini API xatoligi")
-        await message.reply_text(
-            "⚠️ Hozir javob olishda xatolik yuz berdi. "
-            "Birozdan so'ng qayta urinib ko'ring."
+        await status.edit_text(
+            "⚠️ AI xizmatida vaqtinchalik xatolik yuz berdi. "
+            "Birozdan so‘ng qayta urinib ko‘ring."
         )
 
-# ---------- RENDER WEB SERVICE UCHUN ----------
 
-async def health_server(reader, writer):
+# =========================
+# RENDER HEALTH CHECK
+# =========================
+
+async def health_check(reader, writer):
     try:
-        await reader.read(4096)
+        await asyncio.wait_for(reader.readline(), timeout=2)
+
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=2)
+            if line in (b"\r\n", b"\n", b""):
+                break
+
         body = b"Save Bot is running"
         response = (
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/plain; charset=utf-8\r\n"
-            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-            b"Connection: close\r\n\r\n" + body
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: close\r\n\r\n"
+            + body
         )
         writer.write(response)
         await writer.drain()
     except Exception:
-        logging.exception("Health server xatoligi")
+        pass
     finally:
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
+
+# =========================
+# ISHGA TUSHIRISH
+# =========================
 
 async def main():
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("save", save_text))
-    app.add_handler(CommandHandler("saved", saved_items))
-    app.add_handler(CommandHandler("clear", clear_history))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("save", save_text))
+    application.add_handler(CommandHandler("saved", show_saved))
+    application.add_handler(CommandHandler("clear", clear_saved))
 
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO | filters.VIDEO | filters.Document.ALL,
-            save_media,
-        )
+    media_filter = (
+        filters.PHOTO
+        | filters.VIDEO
+        | filters.Document.ALL
+        | filters.AUDIO
+        | filters.VOICE
+    )
+    application.add_handler(MessageHandler(media_filter, save_media))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, ai_chat)
     )
 
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, ask_ai)
-    )
-
-    await app.initialize()
-    await app.start()
-
-    if app.updater is None:
-        raise RuntimeError("Telegram updater ishga tushmadi!")
-
-    await app.updater.start_polling(drop_pending_updates=False)
-
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.getenv("PORT", "10000"))
     server = await asyncio.start_server(
-        health_server,
-        host="0.0.0.0",
-        port=port,
+        health_check, host="0.0.0.0", port=port
     )
 
-    logging.info("Save Bot ishga tushdi. Port: %s", port)
+    logging.info("Health server %s-portda ishga tushdi.", port)
 
-    async with server:
-        await server.serve_forever()
+    try:
+        async with application:
+            await application.start()
+
+            if application.updater is None:
+                raise RuntimeError("Telegram updater ishga tushmadi.")
+
+            await application.updater.start_polling()
+            logging.info("Save Bot ishga tushdi.")
+
+            async with server:
+                await asyncio.Event().wait()
+
+    finally:
+        server.close()
+        await server.wait_closed()
+
+        if application.updater and application.updater.running:
+            await application.updater.stop()
+
+        if application.running:
+            await application.stop()
+
+        logging.info("Save Bot to‘xtatildi.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Save Bot to'xtatildi.")
+        logging.info("Dastur to‘xtatildi.")
