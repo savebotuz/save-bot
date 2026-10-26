@@ -1,4 +1,4 @@
-
+import time
 import os
 import asyncio
 import sqlite3
@@ -254,11 +254,19 @@ async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("🤔 Javob tayyorlayapman...")
 
     try:
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
+       from google.genai.errors import ServerError
+
+for attempt in range(3):
+    try:
+        response = client.models.generate_content(
             model=MODEL_NAME,
-            contents=prompt,
+            contents=prompt
         )
+        break
+    except ServerError:
+        if attempt == 2:
+            raise
+        time.sleep(2 ** (attempt + 1))
 
         answer = response.text or "Kechirasiz, hozir javob tayyorlay olmadim."
 
